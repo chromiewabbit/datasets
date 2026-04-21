@@ -182,7 +182,7 @@ def main():
         "device_map": "auto",
         "trust_remote_code": True,
         "torch_dtype": compute_dtype,
-        "attn_implementation": "flash_attention_2",
+        "attn_implementation": "sdpa",
     }
 
     if args.rope_scaling_factor > 1.0:
