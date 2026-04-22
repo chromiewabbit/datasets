@@ -2,26 +2,24 @@
 
 import torch
 import os
-import json
 import argparse
-from datasets import load_dataset, Dataset
+from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     BitsAndBytesConfig,
-    TrainingArguments,
     EarlyStoppingCallback,
+    DataCollatorForCompletionOnlyLM,   # Correct: from transformers, not trl
 )
+from trl import SFTTrainer, SFTConfig   # SFTConfig is the modern config class
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
-import numpy as np
 
 # --- 1. Environment Setup ---
 def setup_cuda_environment():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    os.environ["CUDA_GRAPHS"] = "1"
+    os.environ["CUDA_GRAPHS"] = "1"          # Enables CUDA graph capture for speed
     print("✓ NVIDIA CUDA environment configured.")
 
 setup_cuda_environment()
@@ -61,7 +59,7 @@ def format_instruction(example):
 def main():
     args = parse_args()
 
-    # Quantization
+    # Quantization config
     compute_dtype = torch.bfloat16
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -70,7 +68,7 @@ def main():
         bnb_4bit_compute_dtype=compute_dtype,
     )
 
-    # Model
+    # Load model with FlashAttention-2 and optional RoPE scaling
     print(f"Loading model: {args.model_name}")
     model_kwargs = {
         "quantization_config": bnb_config,
@@ -89,11 +87,11 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # Gradient checkpointing & k-bit training
+    # Gradient checkpointing & k-bit preparation
     model.gradient_checkpointing_enable()
     model = prepare_model_for_kbit_training(model)
 
-    # LoRA
+    # LoRA configuration
     lora_config = LoraConfig(
         r=32,
         lora_alpha=64,
@@ -107,9 +105,7 @@ def main():
 
     # Load dataset
     print(f"Loading dataset: {args.dataset_path}")
-    if args.dataset_path.endswith('.jsonl'):
-        dataset = load_dataset('json', data_files=args.dataset_path, split='train')
-    elif args.dataset_path.endswith('.json'):
+    if args.dataset_path.endswith('.jsonl') or args.dataset_path.endswith('.json'):
         dataset = load_dataset('json', data_files=args.dataset_path, split='train')
     elif args.dataset_path.endswith('.csv'):
         dataset = load_dataset('csv', data_files=args.dataset_path, split='train')
@@ -125,12 +121,16 @@ def main():
     train_dataset = dataset["train"]
     eval_dataset = dataset["test"]
 
-    # Response template for loss masking (only compute loss on assistant part)
+    # Data collator for loss masking (only compute loss on assistant responses)
     response_template = "<|im_start|>assistant"
-    collator = DataCollatorForCompletionOnlyLM(response_template, tokenizer=tokenizer)
+    collator = DataCollatorForCompletionOnlyLM(
+        response_template=response_template,
+        tokenizer=tokenizer,
+        mlm=False,          # Important: we are doing causal LM, not masked LM
+    )
 
-    # Training arguments
-    training_args = TrainingArguments(
+    # Training arguments using SFTConfig (modern replacement for TrainingArguments)
+    training_args = SFTConfig(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_train_batch_size,
@@ -156,9 +156,12 @@ def main():
         dataloader_pin_memory=True,
         dataloader_prefetch_factor=2 if args.dataloader_num_workers > 0 else None,
         remove_unused_columns=False,
+        # Packing and sequence length (critical for throughput)
+        packing=args.packing,
+        max_seq_length=args.max_seq_length,
     )
 
-    # SFTTrainer with packing
+    # Trainer
     trainer = SFTTrainer(
         model=model,
         args=training_args,
@@ -166,8 +169,6 @@ def main():
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         data_collator=collator,
-        max_seq_length=args.max_seq_length,
-        packing=args.packing,
         dataset_text_field="text",
         callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
     )
